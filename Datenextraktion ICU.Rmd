@@ -1,0 +1,205 @@
+---
+title: "Patient overview"
+author: "Johann Hawe"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE)
+
+library(XLConnect)
+library(ggplot2)
+library(knitr)
+source("scripts/lib.R")
+
+# set some options
+options("XLConnect.dateTimeFormat" = "%Y-%m-%d")
+options("java.parameters" = "-Xmx10g")
+
+```
+
+## Preprocessing
+
+In this markdown we merely process the patient data and generate some simple
+exploratory plots.
+From each of the excel files we have at hand, we extract the information from 
+three sheets overall: 'Stammdaten', 'Euroscore II' and 'Verlegungskriterien'.
+For each entry we create two distinct keys:
+
+* **key_visit**: A unique identifier for each entry: Name-Surname-Birthday-Entryday
+* **key_patient**: A unique identifier for each patient: Name-Surname-Birthday
+
+The **key_visit** identifier is unique over all entries in the result table, whereas
+the **key_patient** identifier is only unique for patients, not however for the different 
+visits (i.e. a patient being in for surgery more than once has the same **key_patient** but a different **key_visit** for each of the stays).
+
+In the next three sections we briefly describe the general strategies used to extract data and merged them into a single table.
+
+### Stammdaten
+We extract most of the data from this sheet 'as is', i.e. we directly use the values
+in the individual fields for the entries in our data matrix.
+For the more complex data, i.e. "Diagnose_Behandlung", "Anamnese", "Medikation" etc. we always 
+extract all the entries below the respective captions. Each entry was then simply concatenated to form a single string (separator used: ';'),
+and all entries were in the end merged to a single value for the respective entry / patient (separator used: '|').
+All occurrences of the used separators were replaced with "," before concatenating the entries.
+
+### Euroscore II
+Again, we just extract the score 'as is', in this case meaning that we create the names
+(e.g. Komorbiditaet.IDDM) and add as a value the entry in the respective field of the 'C' column (e.g. 'y').
+Finally, we directly extract the risk of martality score from field D47.
+
+### Verlegungskriterien
+We create as for the Euroscore II sheet the names for each of the entires, e.g. CVS.Katecholamintherapie.
+As values for each of the names we always create triple of the form "JA:;TEILWEISE:;NEIN:", and we
+write to each value of the triple the value in the respective field in the sheet, e..g "JA:;TEILWEISE:;NEIN:x".
+This was done to avoid creating a multitude of columns (i.e. CVS.Katecholamintherapie.JA, CVS.Katecholamintherapie.TEILWEISE, CVS.Katecholamintherapie.NEIN etc.) but nevertheless contains all the information present in the sheet. In addition,
+we extracted the last three rows (43-45) using the same concept but with different triples (i.e. "empfohlen:;erfolgt:;nicht erfolgt:").
+Likely, this does not make sense for the last two rows as indicated in the sheet, but is currently used for convenience and can be ignored during any further analysis.
+The above mentioned approach can easily be adjusted (e.g. to multiple columns) upon further discussion.
+
+```{r load_patients, echo=F}
+
+ddata <- "F:/Data/neue rohdaten/ICU 2020"
+fout <- "F:/Data/neue rohdaten/merged_2021.tsv"
+pfiles <- list.files(ddata, 
+                           pattern="*.xlsx$", full.names = T)
+print(paste0("Processing ", length(pfiles), " files with patient data."))
+
+# define function wrapper for reading the excel files
+read_patient_file <- function(pf, sheet_name) {
+  return(readWorksheetFromFile(pf, 
+                               sheet_name,
+                               header = F))
+}
+
+patient_list <- lapply(pfiles, function(pf) {
+  # free java memory. this seems necessary
+  # since otherwise we get quite some memory 
+  # errors
+  XLConnect::xlcFreeMemory()
+  
+  result <- NULL
+  
+  tryCatch({
+    
+    # read the work book
+    wb <- loadWorkbook(pf)
+    
+    sheet <- "Stammdaten"
+    if(existsSheet(wb, sheet)) {
+      df <- read_patient_file(pf, sheet)
+      base_data <- process_basedata(df)
+    } else {
+      warning(paste0("Worksheet '", sheet, "' does not exist.\n"))
+    }
+    
+    sheet <- "EUROSCORE II"
+    if(existsSheet(wb, sheet)) {
+      df <- read_patient_file(pf, sheet)
+      euroscore_data <- process_euroscore(df)
+    } else {
+      warning(paste0("Worksheet '", sheet, "' does not exist.\n"))
+      euroscore_data <- c()
+    }
+    
+    sheet <- "Verlegungskriterien"
+    if(existsSheet(wb, sheet)) {
+      df <- read_patient_file(pf, sheet)
+      mvt_criteria <- process_mvt_criteria(df)
+    } else {
+      warning(paste0("Worksheet '", sheet, "' does not exist.\n"))
+      mvt_criteria <- c()
+    }
+    
+    # create result vector
+    result <- c(base_data, euroscore_data, mvt_criteria)
+    
+    }, error=function(err) {
+      print("Error, skipping patient:")
+      print(err)
+      result <- NULL
+  })
+  result
+})
+
+# ----------------------------------------------------------------------------
+# create data frame for all patients. this is a bit complicated
+# but we want to make sure that the columns match at this point
+# ----------------------------------------------------------------------------
+cols <- unique(unlist(lapply(patient_list, names)))
+df <- as.data.frame(matrix(ncol=length(cols)))
+colnames(df) <- gsub("\n", "_", gsub("[\r\n]", "_", cols))
+
+# ----------------------------------------------------------------------------
+# populate the list
+# ----------------------------------------------------------------------------
+for(i in 1:length(patient_list)) {
+  if(i != 1) {
+    df <- rbind(df, rep(NA, ncol(df)))
+  }
+  p <- patient_list[[i]]
+  for(n in names(p)) {
+    df[i,n] <- gsub("\n", "_", gsub("[\r\n]", "_", p[n]))
+  }
+}
+
+# ----------------------------------------------------------------------------
+# remove uncommun symbols nad NAs for sex
+# ----------------------------------------------------------------------------
+df <- df[!(df[,"sex"] != "m" & df[,"sex"] != "w"),]
+df <- df[!is.na(df[,"sex"]),]
+
+# ----------------------------------------------------------------------------
+# all done
+# ----------------------------------------------------------------------------
+print("First 5 columns and rows of the data:")
+print(df[1:min(5, nrow(df)),1:min(5, ncol(df))])
+
+write.table(df, file=fout, col.names=T, row.names=F, sep="\t", fileEncoding = "UTF-8")
+```
+
+For the final result table, we extracted a total of `r ncol(df)` different variables from 
+the sheets of `r length(unique(df[,"key_patient"]))` patients. Note again, that for each new visit of the same patient in
+the hospital, we have a new data entry, i.e. we have more data entries than we have number 
+of patients. Overall, we have `r nrow(df)` unique data entries.
+
+Below we show the list of variables we extracted from the data:
+```{r variables, echo=F}
+print(colnames(df))
+```
+## Exploration
+
+We do some basic exploration of the data. For now, we only create four different 
+plots, showing the overall numbers of female/male individuals and their
+distributions of weight, height and BMI.
+
+```{r exploration, echo=F}
+plot_tab <- as.data.frame(df)
+plot_tab[,"weight"] <- as.numeric(as.character(plot_tab[,"weight"]))
+plot_tab[,"height"] <- as.numeric(as.character(plot_tab[,"height"]))
+plot_tab[,"BMI"] <- as.numeric(as.character(plot_tab[,"BMI"]))
+
+
+ggplot(aes(x=sex, fill=sex), data=plot_tab) + geom_histogram(stat="count") + 
+  ggtitle("Number of female/male patients across all records.")
+
+ggplot(aes(x=weight, fill=sex), data=plot_tab) + geom_histogram() + facet_wrap( ~ sex)+ 
+  ggtitle("Distribution of weight across all patiens", "Stratified by sex.")
+ggplot(aes(x=height, fill=sex), data=plot_tab) + geom_histogram() + facet_wrap( ~ sex)+ 
+  ggtitle("Distribution of height across all patiens", "Stratified by sex.")
+ggplot(aes(x=BMI, fill=sex), data=plot_tab) + geom_histogram() + facet_wrap( ~ sex)+ 
+  ggtitle("Distribution of BMI across all patiens", "Stratified by sex.")
+
+```
+
+## Conclusion
+TODO
+
+## References
+TODO
+
+## Sessioninfo
+```{r echo=F}
+sessionInfo()
+```
